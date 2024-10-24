@@ -663,8 +663,6 @@ class Trainer(object):
 
             if validate and is_snapshot:
                 if self.cfg['architecture'] in MOT_ARCH:
-                    # import threading
-                    # if threading.currentThread().getName() == "MainThread":
                     self.mot_evaluate()
                 else:
                     if not hasattr(self, '_eval_loader'):

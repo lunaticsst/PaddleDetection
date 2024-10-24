@@ -7,3 +7,10 @@ _BASE_: [
 ]
 
 weights: output/fairmot_dla34_30e_1088x608/model_final
+
+EvalDataset:
+  name: MOTImageFolder
+  dataset_dir: dataset/mot
+  data_root: MOT17/images/train
+  keep_ori_im: False # set True if save visualization images or video, or used in DeepSORT
+  data_fields: ['image']
