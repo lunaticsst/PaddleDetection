@@ -22,6 +22,7 @@ import copy
 import time
 import yaml
 from tqdm import tqdm
+import glob
 
 import numpy as np
 import typing
@@ -40,7 +41,7 @@ from ppdet.core.workspace import create
 from ppdet.utils.checkpoint import load_weight, load_pretrain_weight, convert_to_dict
 from ppdet.utils.visualizer import visualize_results, save_result
 from ppdet.metrics import get_infer_results, KeyPointTopDownCOCOEval, KeyPointTopDownCOCOWholeBadyHandEval, KeyPointTopDownMPIIEval, Pose3DEval
-from ppdet.metrics import Metric, COCOMetric, VOCMetric, WiderFaceMetric, RBoxMetric, JDEDetMetric, SNIPERCOCOMetric, CULaneMetric
+from ppdet.metrics import Metric, COCOMetric, VOCMetric, WiderFaceMetric, RBoxMetric, JDEDetMetric, SNIPERCOCOMetric, CULaneMetric, MOTMetric
 from ppdet.data.source.sniper_coco import SniperCOCODataSet
 from ppdet.data.source.category import get_categories
 import ppdet.utils.stats as stats
@@ -48,6 +49,12 @@ from ppdet.utils.fuse_utils import fuse_conv_bn
 from ppdet.utils import profiler
 from ppdet.modeling.post_process import multiclass_nms
 from ppdet.modeling.lane_utils import imshow_lanes
+from ppdet.modeling.mot.utils import MOTTimer
+from ppdet.modeling.mot.utils import MOTTimer, load_det_results, write_mot_results, save_vis_results
+from ppdet.modeling.mot.utils import Detection, get_crops, scale_coords, clip_box
+from ppdet.modeling.mot.tracker import DeepSORTTracker, OCSORTTracker, BOTSORTTracker
+from ppdet.modeling.mot.tracker import JDETracker, CenterTracker
+from collections import defaultdict
 
 from .callbacks import Callback, ComposeCallback, LogPrinter, Checkpointer, WiferFaceEval, VisualDLWriter, SniperProposalsGenerator, WandbCallback, SemiCheckpointer, SemiLogPrinter
 from .export_utils import _dump_infer_config, _prune_input_spec, apply_to_static
@@ -655,34 +662,39 @@ class Trainer(object):
             self._compose_callback.on_epoch_end(self.status)
 
             if validate and is_snapshot:
-                if not hasattr(self, '_eval_loader'):
-                    # build evaluation dataset and loader
-                    self._eval_dataset = self.cfg.EvalDataset
-                    self._eval_batch_sampler = \
-                        paddle.io.BatchSampler(
-                            self._eval_dataset,
-                            batch_size=self.cfg.EvalReader['batch_size'])
-                    # If metric is VOC, need to be set collate_batch=False.
-                    if self.cfg.metric == 'VOC':
-                        self.cfg['EvalReader']['collate_batch'] = False
-                    if self.cfg.metric == "Pose3DEval":
-                        self._eval_loader = create('EvalReader')(
-                            self._eval_dataset, self.cfg.worker_num)
-                    else:
-                        self._eval_loader = create('EvalReader')(
-                            self._eval_dataset,
-                            self.cfg.worker_num,
-                            batch_sampler=self._eval_batch_sampler)
-                # if validation in training is enabled, metrics should be re-init
-                # Init_mark makes sure this code will only execute once
-                if validate and Init_mark == False:
-                    Init_mark = True
-                    self._init_metrics(validate=validate)
-                    self._reset_metrics()
+                if self.cfg['architecture'] in MOT_ARCH:
+                    # import threading
+                    # if threading.currentThread().getName() == "MainThread":
+                    self.mot_evaluate()
+                else:
+                    if not hasattr(self, '_eval_loader'):
+                        # build evaluation dataset and loader
+                        self._eval_dataset = self.cfg.EvalDataset
+                        self._eval_batch_sampler = \
+                            paddle.io.BatchSampler(
+                                self._eval_dataset,
+                                batch_size=self.cfg.EvalReader['batch_size'])
+                        # If metric is VOC, need to be set collate_batch=False.
+                        if self.cfg.metric == 'VOC':
+                            self.cfg['EvalReader']['collate_batch'] = False
+                        if self.cfg.metric == "Pose3DEval":
+                            self._eval_loader = create('EvalReader')(
+                                self._eval_dataset, self.cfg.worker_num)
+                        else:
+                            self._eval_loader = create('EvalReader')(
+                                self._eval_dataset,
+                                self.cfg.worker_num,
+                                batch_sampler=self._eval_batch_sampler)
+                    # if validation in training is enabled, metrics should be re-init
+                    # Init_mark makes sure this code will only execute once
+                    if validate and Init_mark == False:
+                        Init_mark = True
+                        self._init_metrics(validate=validate)
+                        self._reset_metrics()
 
-                with paddle.no_grad():
-                    self.status['save_best_model'] = True
-                    self._eval_with_loader(self._eval_loader)
+                    with paddle.no_grad():
+                        self.status['save_best_model'] = True
+                        self._eval_with_loader(self._eval_loader)
 
             if is_snapshot and self.use_ema:
                 # reset original weight
@@ -1504,3 +1516,463 @@ class Trainer(object):
                     setattr(layer, name, new_sublayer)
 
         return layer
+
+
+    def mot_evaluate(self,
+                     data_type='mot',
+                     model_type='',
+                     save_images=False,
+                     save_videos=False,
+                     show_image=False,
+                     scaled=True,
+                     det_results_dir=''):
+                     
+        self.status['sample_num'] = 0
+        self.status['save_best_model'] = True
+
+        data_root = self.cfg['EvalMOTDataset'].data_root
+        dataset_dir = self.cfg['EvalMOTDataset'].dataset_dir
+        data_root = '{}/{}'.format(dataset_dir, data_root)
+
+        seqs = os.listdir(data_root)
+        seqs.sort()
+
+        self._eval_dataset = self.cfg['EvalMOTDataset']
+        anno_file = self._eval_dataset.get_anno()
+        clsid2catid, catid2name = get_categories('MOT', anno_file=anno_file)   # self.cfg.metric
+        self.ids2names = []
+        for k, v in catid2name.items():
+            self.ids2names.append(v)
+
+        self._metrics = [MOTMetric(), ]
+
+        if not os.path.exists(self.cfg['save_dir']): os.makedirs(self.cfg['save_dir'])
+        result_root = os.path.join(self.cfg['save_dir'], 'mot_results')
+        if not os.path.exists(result_root): os.makedirs(result_root)
+
+        MOT_DATA_TYPE = ['mot', 'mcmot', 'kitti']
+        MOT_ARCH = ['JDE', 'FairMOT', 'DeepSORT', 'ByteTrack', 'CenterTrack']
+        MOT_ARCH_JDE = MOT_ARCH[:2]
+        MOT_ARCH_SDE = MOT_ARCH[2:4]
+
+        model_type = self.cfg['architecture']
+        assert data_type in MOT_DATA_TYPE, \
+            "data_type should be 'mot', 'mcmot' or 'kitti'"
+        assert model_type in MOT_ARCH, \
+            "model_type should be 'JDE', 'DeepSORT', 'FairMOT' or 'ByteTrack'"
+
+        # run tracking
+        n_frame = 0
+        timer_avgs, timer_calls = [], []
+        self._compose_callback.on_epoch_begin(self.status)
+        for seq in seqs:
+            infer_dir = os.path.join(data_root, seq)
+            if not os.path.exists(infer_dir) or not os.path.isdir(infer_dir):
+                logger.warning("Seq {} error, {} has no images.".format(
+                    seq, infer_dir))
+                continue
+            if os.path.exists(os.path.join(infer_dir, 'img1')):
+                infer_dir = os.path.join(infer_dir, 'img1')
+
+            frame_rate = 30
+            seqinfo = os.path.join(data_root, seq, 'seqinfo.ini')
+            if os.path.exists(seqinfo):
+                meta_info = open(seqinfo).read()
+                frame_rate = int(meta_info[meta_info.find('frameRate') + 10:
+                                           meta_info.find('\nseqLength')])
+
+            save_dir = os.path.join(self.cfg['save_dir'], 'mot_outputs',
+                                    seq) if save_images or save_videos else None
+            logger.info('Evaluate seq: {}'.format(seq))
+
+            self._eval_dataset.set_images(self.get_mot_infer_images(infer_dir))
+            self._eval_batch_sampler = paddle.io.BatchSampler(
+                                self._eval_dataset,
+                                batch_size=self.cfg.EvalMOTReader['batch_size'])
+            self._eval_dataloader = create('EvalMOTReader')(self._eval_dataset,
+                                self.cfg.worker_num,
+                                batch_sampler=self._eval_batch_sampler)
+            self.status['sample_num'] += len(self._eval_dataset.image_dir)
+
+            result_filename = os.path.join(result_root, '{}.txt'.format(seq))
+            with paddle.no_grad():
+                if model_type in MOT_ARCH_JDE:
+                    results, nf, ta, tc = self._eval_seq_jde(
+                        self._eval_dataloader,
+                        save_dir=save_dir,
+                        show_image=show_image,
+                        frame_rate=frame_rate)
+                elif model_type in MOT_ARCH_SDE:
+                    results, nf, ta, tc = self._eval_seq_sde(
+                        self._eval_dataloader,
+                        save_dir=save_dir,
+                        show_image=show_image,
+                        frame_rate=frame_rate,
+                        seq_name=seq,
+                        scaled=True,
+                        det_file=os.path.join(det_results_dir,
+                                              '{}.txt'.format(seq)))
+                elif model_type == 'CenterTrack':
+                    results, nf, ta, tc = self._eval_seq_centertrack(
+                        self._eval_dataloader,
+                        save_dir=save_dir,
+                        show_image=show_image,
+                        frame_rate=frame_rate)
+                else:
+                    raise ValueError(model_type)
+
+            write_mot_results(result_filename, results, data_type,
+                              self.cfg.num_classes)
+            n_frame += nf
+            timer_avgs.append(ta)
+            timer_calls.append(tc)
+
+            # update metrics
+            for metric in self._metrics:
+                metric.update(data_root, seq, data_type, result_root,
+                              result_filename)
+
+        timer_avgs = np.asarray(timer_avgs)
+        timer_calls = np.asarray(timer_calls)
+        all_time = np.dot(timer_avgs, timer_calls)
+        avg_time = all_time / np.sum(timer_calls)
+        logger.info('Time elapsed: {:.2f} seconds, FPS: {:.2f}'.format(
+            all_time, 1.0 / avg_time))
+        self.status['cost_time'] = all_time
+
+        # accumulate metric to log out
+        for metric in self._metrics:
+            metric.accumulate()
+            metric.log()
+        
+        self._compose_callback.on_epoch_end(self.status)
+        # reset metric states for metric may performed multiple times
+        self._reset_metrics()
+
+    def get_mot_infer_images(self, infer_dir):
+        assert infer_dir is None or os.path.isdir(infer_dir), \
+            "{} is not a directory".format(infer_dir)
+        images = set()
+        assert os.path.isdir(infer_dir), \
+            "infer_dir {} is not a directory".format(infer_dir)
+        exts = ['jpg', 'jpeg', 'png', 'bmp']
+        exts += [ext.upper() for ext in exts]
+        for ext in exts:
+            images.update(glob.glob('{}/*.{}'.format(infer_dir, ext)))
+        images = list(images)
+        images.sort()
+        assert len(images) > 0, "no image found in {}".format(infer_dir)
+        logger.info("Found {} inference images in total.".format(len(images)))
+        return images
+
+
+    def _eval_seq_jde(self,
+                      dataloader,
+                      save_dir=None,
+                      show_image=False,
+                      frame_rate=30,
+                      draw_threshold=0):
+        if save_dir:
+            if not os.path.exists(save_dir): os.makedirs(save_dir)
+        tracker = self.model.tracker
+        tracker.max_time_lost = int(frame_rate / 30.0 * tracker.track_buffer)
+
+        timer = MOTTimer()
+        frame_id = 0
+
+        self.status['mode'] = 'eval'
+        self.model.eval()
+        results = defaultdict(list)  # support single class and multi classes
+
+        for step_id, data in enumerate(tqdm(dataloader)):
+            self.status['step_id'] = step_id
+            self._compose_callback.on_step_begin(self.status)
+            # forward
+            timer.tic()
+            pred_dets, pred_embs = self.model(data)
+
+            pred_dets, pred_embs = pred_dets.numpy(), pred_embs.numpy()
+            online_targets_dict = self.model.tracker.update(pred_dets,
+                                                            pred_embs)
+            online_tlwhs = defaultdict(list)
+            online_scores = defaultdict(list)
+            online_ids = defaultdict(list)
+            for cls_id in range(self.cfg.num_classes):
+                online_targets = online_targets_dict[cls_id]
+                for t in online_targets:
+                    tlwh = t.tlwh
+                    tid = t.track_id
+                    tscore = t.score
+                    if tlwh[2] * tlwh[3] <= tracker.min_box_area: continue
+                    if tracker.vertical_ratio > 0 and tlwh[2] / tlwh[
+                            3] > tracker.vertical_ratio:
+                        continue
+                    online_tlwhs[cls_id].append(tlwh)
+                    online_ids[cls_id].append(tid)
+                    online_scores[cls_id].append(tscore)
+                # save results
+                results[cls_id].append(
+                    (frame_id + 1, online_tlwhs[cls_id], online_scores[cls_id],
+                    online_ids[cls_id]))
+
+            timer.toc()
+
+            frame_id += 1
+            self._compose_callback.on_step_end(self.status)
+
+        return results, frame_id, timer.average_time, timer.calls
+
+
+    def _eval_seq_sde(self,
+                      dataloader,
+                      save_dir=None,
+                      show_image=False,
+                      frame_rate=30,
+                      seq_name='',
+                      scaled=False,
+                      det_file='',
+                      draw_threshold=0):
+        if save_dir:
+            if not os.path.exists(save_dir): os.makedirs(save_dir)
+        use_detector = False if not self.model.detector else True
+        use_reid = hasattr(self.model, 'reid')
+        if use_reid and self.model.reid is not None:
+            use_reid = True
+        else:
+            use_reid = False
+
+        timer = MOTTimer()
+        results = defaultdict(list)
+        frame_id = 0
+        self.status['mode'] = 'eval'
+        self.model.eval()
+        if use_reid:
+            self.model.reid.eval()
+        if not use_detector:
+            dets_list = load_det_results(det_file, len(dataloader))
+            logger.info('Finish loading detection results file {}.'.format(
+                det_file))
+
+        tracker = self.model.tracker
+
+        for step_id, data in enumerate(tqdm(dataloader)):
+            self.status['step_id'] = step_id
+            ori_image = data['ori_image']
+            ori_image_shape = data['ori_image'].shape[1:3]
+
+            input_shape = data['image'].shape[2:]
+
+            im_shape = data['im_shape'][0].numpy()
+            scale_factor = data['scale_factor'][0].numpy()
+
+            empty_detections = False
+
+            # forward
+            timer.tic()
+            if not use_detector:
+                dets = dets_list[frame_id]
+                bbox_tlwh = np.array(dets['bbox'], dtype='float32')
+                if bbox_tlwh.shape[0] > 0:
+                    pred_cls_ids = np.array(dets['cls_id'], dtype='float32')
+                    pred_scores = np.array(dets['score'], dtype='float32')
+                    pred_bboxes = np.concatenate(
+                        (bbox_tlwh[:, 0:2],
+                         bbox_tlwh[:, 2:4] + bbox_tlwh[:, 0:2]),
+                        axis=1)
+                else:
+                    logger.warning(
+                        'Frame {} has not object, try to modify score threshold.'.
+                        format(frame_id))
+                    empty_detections = True
+            else:
+                outs = self.model.detector(data)
+                outs['bbox'] = outs['bbox'].numpy()
+                outs['bbox_num'] = outs['bbox_num'].numpy()
+
+                if len(outs['bbox']) > 0 and empty_detections == False:
+                    pred_cls_ids = outs['bbox'][:, 0:1]
+                    pred_scores = outs['bbox'][:, 1:2]
+                    if not scaled:
+                        # Note: scaled=False only in JDE YOLOv3 or other detectors
+                        # with LetterBoxResize and JDEBBoxPostProcess.
+                        #
+                        # 'scaled' means whether the coords after detector outputs
+                        # have been scaled back to the original image, set True 
+                        # in general detector, set False in JDE YOLOv3.
+                        pred_bboxes = scale_coords(outs['bbox'][:, 2:],
+                                                   input_shape, im_shape,
+                                                   scale_factor)
+                    else:
+                        pred_bboxes = outs['bbox'][:, 2:]
+                    pred_dets_old = np.concatenate(
+                        (pred_cls_ids, pred_scores, pred_bboxes), axis=1)
+                else:
+                    logger.warning(
+                        'Frame {} has not detected object, try to modify score threshold.'.
+                        format(frame_id))
+                    empty_detections = True
+
+            if not empty_detections:
+                pred_xyxys, keep_idx = clip_box(pred_bboxes, ori_image_shape)
+                if len(keep_idx[0]) == 0:
+                    logger.warning(
+                        'Frame {} has not detected object left after clip_box.'.
+                        format(frame_id))
+                    empty_detections = True
+
+            if empty_detections:
+                timer.toc()
+                # if visualize, use original image instead
+                online_ids, online_tlwhs, online_scores = None, None, None
+                save_vis_results(data, frame_id, online_ids, online_tlwhs,
+                                 online_scores, timer.average_time, show_image,
+                                 save_dir, self.cfg.num_classes, self.ids2names)
+                frame_id += 1
+                # thus will not inference reid model
+                continue
+
+            pred_cls_ids = pred_cls_ids[keep_idx[0]]
+            pred_scores = pred_scores[keep_idx[0]]
+            pred_dets = np.concatenate(
+                (pred_cls_ids, pred_scores, pred_xyxys), axis=1)
+
+            if use_reid:
+                crops = get_crops(
+                    pred_xyxys,
+                    ori_image,
+                    w=tracker.input_size[0],
+                    h=tracker.input_size[1])
+                crops = paddle.to_tensor(crops)
+
+                data.update({'crops': crops})
+                pred_embs = self.model(data)['embeddings'].numpy()
+            else:
+                pred_embs = None
+
+            if isinstance(tracker, DeepSORTTracker):
+                online_tlwhs, online_scores, online_ids = [], [], []
+                tracker.predict()
+                online_targets = tracker.update(pred_dets, pred_embs)
+                for t in online_targets:
+                    if not t.is_confirmed() or t.time_since_update > 1:
+                        continue
+                    tlwh = t.to_tlwh()
+                    tscore = t.score
+                    tid = t.track_id
+                    if tscore < draw_threshold: continue
+                    if tlwh[2] * tlwh[3] <= tracker.min_box_area: continue
+                    if tracker.vertical_ratio > 0 and tlwh[2] / tlwh[
+                            3] > tracker.vertical_ratio:
+                        continue
+                    online_tlwhs.append(tlwh)
+                    online_scores.append(tscore)
+                    online_ids.append(tid)
+                timer.toc()
+
+                # save results
+                results[0].append(
+                    (frame_id + 1, online_tlwhs, online_scores, online_ids))
+
+            elif isinstance(tracker, JDETracker):
+                # trick hyperparams only used for MOTChallenge (MOT17, MOT20) Test-set
+                tracker.track_buffer, tracker.conf_thres = self.get_trick_hyperparams(
+                    seq_name, tracker.track_buffer, tracker.conf_thres)
+
+                online_targets_dict = tracker.update(pred_dets_old, pred_embs)
+                online_tlwhs = defaultdict(list)
+                online_scores = defaultdict(list)
+                online_ids = defaultdict(list)
+                for cls_id in range(self.cfg.num_classes):
+                    online_targets = online_targets_dict[cls_id]
+                    for t in online_targets:
+                        tlwh = t.tlwh
+                        tid = t.track_id
+                        tscore = t.score
+                        if tlwh[2] * tlwh[3] <= tracker.min_box_area: continue
+                        if tracker.vertical_ratio > 0 and tlwh[2] / tlwh[
+                                3] > tracker.vertical_ratio:
+                            continue
+                        online_tlwhs[cls_id].append(tlwh)
+                        online_ids[cls_id].append(tid)
+                        online_scores[cls_id].append(tscore)
+                    # save results
+                    results[cls_id].append(
+                        (frame_id + 1, online_tlwhs[cls_id],
+                         online_scores[cls_id], online_ids[cls_id]))
+                timer.toc()
+
+            elif isinstance(tracker, OCSORTTracker):
+                # OC_SORT Tracker
+                online_targets = tracker.update(pred_dets_old, pred_embs)
+                online_tlwhs = []
+                online_ids = []
+                online_scores = []
+                for t in online_targets:
+                    tlwh = [t[0], t[1], t[2] - t[0], t[3] - t[1]]
+                    tscore = float(t[4])
+                    tid = int(t[5])
+                    if tlwh[2] * tlwh[3] > 0:
+                        online_tlwhs.append(tlwh)
+                        online_ids.append(tid)
+                        online_scores.append(tscore)
+                timer.toc()
+                # save results
+                results[0].append(
+                    (frame_id + 1, online_tlwhs, online_scores, online_ids))
+
+            elif isinstance(tracker, BOTSORTTracker):
+                # BOTSORT Tracker
+                online_targets = tracker.update(
+                    pred_dets_old, img=ori_image.numpy())
+                online_tlwhs = []
+                online_ids = []
+                online_scores = []
+                for t in online_targets:
+                    tlwh = t.tlwh
+                    tid = t.track_id
+                    tscore = t.score
+                    if tlwh[2] * tlwh[3] > 0:
+                        online_tlwhs.append(tlwh)
+                        online_ids.append(tid)
+                        online_scores.append(tscore)
+                timer.toc()
+                # save results
+                results[0].append(
+                    (frame_id + 1, online_tlwhs, online_scores, online_ids))
+
+            else:
+                raise ValueError(tracker)
+            frame_id += 1
+
+        return results, frame_id, timer.average_time, timer.calls
+
+    def get_trick_hyperparams(self, video_name, ori_buffer, ori_thresh):
+        if video_name[:3] != 'MOT':
+            # only used for MOTChallenge (MOT17, MOT20) Test-set
+            return ori_buffer, ori_thresh
+
+        video_name = video_name[:8]
+        if 'MOT17-05' in video_name:
+            track_buffer = 14
+        elif 'MOT17-13' in video_name:
+            track_buffer = 25
+        else:
+            track_buffer = ori_buffer
+
+        if 'MOT17-01' in video_name:
+            track_thresh = 0.65
+        elif 'MOT17-06' in video_name:
+            track_thresh = 0.65
+        elif 'MOT17-12' in video_name:
+            track_thresh = 0.7
+        elif 'MOT17-14' in video_name:
+            track_thresh = 0.67
+        else:
+            track_thresh = ori_thresh
+
+        if 'MOT20-06' in video_name or 'MOT20-08' in video_name:
+            track_thresh = 0.3
+        else:
+            track_thresh = ori_thresh
+
+        return track_buffer, ori_thresh

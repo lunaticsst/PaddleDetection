@@ -56,6 +56,10 @@ def parse_args():
         action='store_true',
         help='Save tracking results (video).')
     parser.add_argument(
+        '--training_weights',
+        action='store_true',
+        help='Evaluate using your own training weghts.')
+    parser.add_argument(
         '--show_image',
         action='store_true',
         help='Show tracking results (image).')
@@ -81,7 +85,10 @@ def run(FLAGS, cfg):
 
     # load weights
     if cfg.architecture in ['DeepSORT', 'ByteTrack']:
-        tracker.load_weights_sde(cfg.det_weights, cfg.reid_weights)
+        tracker.load_weights_sde(cfg.det_weights, 
+                        cfg.reid_weights, 
+                        training_weights=FLAGS.training_weights, 
+                        weights=cfg.weights)
     else:
         tracker.load_weights_jde(cfg.weights)
 

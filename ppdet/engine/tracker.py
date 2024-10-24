@@ -128,16 +128,19 @@ class Tracker(object):
     def load_weights_jde(self, weights):
         load_weight(self.model, weights, self.optimizer)
 
-    def load_weights_sde(self, det_weights, reid_weights):
+    def load_weights_sde(self, det_weights, reid_weights, training_weights=False, weights=None):
         with_detector = self.model.detector is not None
         with_reid = self.model.reid is not None
 
-        if with_detector:
-            load_weight(self.model.detector, det_weights)
-            if with_reid:
-                load_weight(self.model.reid, reid_weights)
+        if training_weights:
+            load_weight(self.model, weights)
         else:
-            load_weight(self.model.reid, reid_weights)
+            if with_detector:
+                load_weight(self.model.detector, det_weights)
+                if with_reid:
+                    load_weight(self.model.reid, reid_weights)
+            else:
+                load_weight(self.model.reid, reid_weights)
 
     def _eval_seq_centertrack(self,
                               dataloader,

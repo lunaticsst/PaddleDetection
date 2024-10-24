@@ -213,6 +213,8 @@ class Checkpointer(Callback):
                         key = 'bbox'
                     elif 'keypoint' in map_res:
                         key = 'keypoint'
+                    elif 'MOTA' in map_res:
+                        key = 'MOTA'
                     else:
                         key = 'mask'
 

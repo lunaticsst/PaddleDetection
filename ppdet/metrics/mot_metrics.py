@@ -20,6 +20,7 @@ import os
 import copy
 import sys
 import math
+import re
 from collections import defaultdict
 import numpy as np
 
@@ -256,7 +257,27 @@ class MOTMetric(Metric):
         print(self.strsummary)
 
     def get_results(self):
-        return self.strsummary
+
+        stdout = self.strsummary
+        pattern = r"OVERALL"
+
+        metric_dict = dict()
+        pattern = re.compile(pattern)
+        # TODO: Use lazy version to make it more efficient
+        lines = stdout.splitlines()
+        # metric_dict[key] = 0
+        for line in lines:
+            match = pattern.search(line)
+            if match:
+                outs = line.split(' ')
+                outs = [i for i in outs if i != ""]
+                metric_dict['MOTA'] = [float(outs[-5].split('%')[0])/100]
+                metric_dict['IDF1'] = [float(outs[1].split('%')[0])/100]
+                metric_dict['IDs'] = [float(outs[-7])]
+                metric_dict['FP'] = [float(outs[-9])]
+                metric_dict['FN'] = [float(outs[-8])]
+
+        return metric_dict
 
 
 class JDEDetMetric(Metric):
